@@ -4,8 +4,51 @@ import numpy as np
 from beamngpy import BeamNGpy, Scenario, Vehicle
 from beamngpy.sensors import Damage, Electrics
 from beamngpy.misc.quat import angle_to_quat
-from shapely import affinity
 from shapely.geometry import LinearRing, LineString, Point, Polygon
+from dataclasses import dataclass, field
+
+
+@dataclass
+class LidarSettings:
+    start_angle: float
+    end_angle: float
+    num_rays: int
+    max_dist: float
+
+
+@dataclass
+class RewardSettings:
+    completion_reward: float
+    progress_multiplier: float
+    time_penalty: float
+    max_damage: float
+    damage_penalty: float
+    out_of_bounds_penalty: float
+    wrong_way_penalty: float
+    too_long_penalty: float
+
+
+@dataclass
+class EnvironmentState:
+    last_vehicle_pos: Point = None
+    remaining_dist: float = None
+    last_remaining_dist: float = None
+    steering_rate: float = 0
+    last_steering: float = 0
+    remaining_time: float = 0
+    spine_speed: float = 0
+    vehicle_rel_angle: float = 0
+    vehicle_elev_angle: float = 0
+    vehicle_velocity: float = 0
+    rpm: float = 0
+    throttle: float = 0
+    brake: float = 0
+    steering: float = 0
+    gear_index: int = 0
+    wheelspeed: float = 0
+    lidar_distances: np.ndarray = field(
+        default_factory=lambda: np.zeros(271, dtype=np.float32)
+    )
 
 
 class WCARaceGeometry(gym.Env):
@@ -16,28 +59,24 @@ class WCARaceGeometry(gym.Env):
         self.steps = self.sim_rate // self.action_rate
 
         # LiDAR settings
-        self.lidar_info = {
-            "start_angle": -np.pi / 2,
-            "end_angle": np.pi / 2,
-            "num_rays": 31,
-            "max_dist": 500,
-        }
+        self.lidar_info = LidarSettings(
+            start_angle=-np.deg2rad(135),
+            end_angle=np.deg2rad(135),
+            num_rays=271,
+            max_dist=500,
+        )
 
         # Reward and penalty settings
-        self.completion_reward = 50
-        self.progress_multiplier = 0.2
-        self.time_penalty = -0.1
-
-        # Ensure penalties are greater than the maximum time penalty
-        self.max_damage = 100
-        self.damage_penalty = -50
-        self.out_of_bounds_penalty = -50
-        self.wrong_way_penalty = -50
-        self.too_long_penalty = -50
-
-        # Define action and observation spaces
-        self.action_space = self._action_space()
-        self.observation_space = self._observation_space()
+        self.reward_settings = RewardSettings(
+            completion_reward=50,
+            progress_multiplier=0.2,
+            time_penalty=-0.1,
+            max_damage=100,
+            damage_penalty=-50,
+            out_of_bounds_penalty=-50,
+            wrong_way_penalty=-50,
+            too_long_penalty=-50,
+        )
 
         # Track and vehicle setup
         self.start_proj = 10
@@ -46,12 +85,16 @@ class WCARaceGeometry(gym.Env):
         self.l_edge = None
         self.r_edge = None
         self.polygon = None
-        self.last_vehicle_pos = None
-        self.last_remaining_dist = None
-        self.last_steering = None
+        self.steering_rate_factor = 0.5
 
-        # Remaining time
-        self.remaining_time = 5 * 60 * (self.start_proj / self.final_proj) + 10
+        # Initialize state
+        self.state = EnvironmentState(
+            remaining_time=10 * 60 * (self.start_proj / self.final_proj)
+        )
+
+        # Define action and observation spaces
+        self.action_space = self._action_space()
+        self.observation_space = self._observation_space()
 
         # Initialize BeamNG
         self.bng = BeamNGpy(host, port)
@@ -106,34 +149,32 @@ class WCARaceGeometry(gym.Env):
         return gym.spaces.Box(
             low=np.array(
                 [
-                    -np.pi,
-                    -np.pi,
-                    -np.inf,
-                    0,
-                    0,
-                    0,
-                    -1.0,
-                    -1,
-                    0,  # vehicle_info
-                    *[0] * self.lidar_info["num_rays"],
-                    -np.inf,
-                    0,  # track_info
+                    -np.pi,  # Relative angle
+                    -np.pi,  # Elevation angle
+                    -np.inf,  # Vehicle velocity
+                    0,  # RPM
+                    0,  # Throttle
+                    0,  # Brake
+                    -1.0,  # Steering
+                    -1,  # Gear index
+                    0,  # Wheelspeed
+                    *[0] * self.lidar_info.num_rays,  # LiDAR
+                    -np.inf,  # Spine speed
                 ]
             ),
             high=np.array(
                 [
-                    np.pi,
-                    np.pi,
-                    np.inf,
-                    np.inf,
-                    1.0,
-                    1.0,
-                    1.0,
-                    8,
-                    np.inf,  # vehicle_info
-                    *[self.lidar_info["max_dist"]] * self.lidar_info["num_rays"],
-                    np.inf,
-                    np.inf,  # track_info
+                    np.pi,  # Relative angle
+                    np.pi,  # Elevation angle
+                    np.inf,  # Vehicle velocity
+                    np.inf,  # RPM
+                    1.0,  # Throttle
+                    1.0,  # Brake
+                    1.0,  # Steering
+                    8,  # Gear index
+                    np.inf,  # Wheelspeed
+                    *[self.lidar_info.max_dist] * self.lidar_info.num_rays,  # LiDAR
+                    np.inf,  # Spine speed
                 ]
             ),
             dtype=np.float64,
@@ -166,9 +207,9 @@ class WCARaceGeometry(gym.Env):
 
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed, options=options)
-        self.remaining_time = 5 * 60 * (self.start_proj / self.final_proj) + 10
-        self.last_remaining_dist = None
-        self.last_vehicle_pos = None
+        self.state.remaining_time = 5 * 60 * (self.start_proj / self.final_proj) + 10
+        self.state.last_remaining_dist = None
+        self.state.last_vehicle_pos = None
         self.vehicle.control(throttle=0.0, brake=0.0, steering=0.0)
         self.bng.scenario.restart()
         self.bng.control.step(30)
@@ -181,12 +222,22 @@ class WCARaceGeometry(gym.Env):
     def _update(self, action):
         action = [*np.clip(action, -1, 1)]
         action = [float(act) for act in action]
-        throttle, steering = action[0], action[1]
+        throttle, self.state.steering_rate = (
+            action[0],
+            action[1] * self.steering_rate_factor,
+        )
         brake = -throttle if throttle < 0 else 0
         throttle = max(throttle, 0)
+
+        # Compute steering angle given a steering rate
+        steering = float(
+            np.clip(self.state.last_steering + self.state.steering_rate, -1, 1)
+        )
+        self.state.last_steering = steering
+
         self.vehicle.control(steering=steering, throttle=throttle, brake=brake)
         self.bng.step(self.steps, wait=True)
-        self.remaining_time -= 1 / self.action_rate
+        self.state.remaining_time -= 1 / self.action_rate
 
     def _get_obs(self) -> np.ndarray:
         self.vehicle.sensors.poll()
@@ -195,23 +246,37 @@ class WCARaceGeometry(gym.Env):
         vehicle_pos = Point(*vehicle_state["pos"])
         vehicle_dir = vehicle_state["dir"]
 
+        # Update state with current observation values
+        self.state.vehicle_rel_angle = self._get_vehicle_rel_angle(
+            vehicle_pos, vehicle_dir
+        )
+        self.state.vehicle_elev_angle = self._get_vehicle_elev_angle(vehicle_dir)
+        self.state.vehicle_velocity = self._get_vehicle_velocity(vehicle_pos)
+        self.state.rpm = electrics["rpm"]
+        self.state.throttle = electrics["throttle"]
+        self.state.brake = electrics["brake"]
+        self.state.steering = electrics["steering"]
+        self.state.gear_index = electrics["gear_index"]
+        self.state.wheelspeed = electrics["wheelspeed"]
+        self.state.lidar_distances = self._get_lidar_distances(
+            vehicle_pos, np.arctan2(vehicle_dir[1], vehicle_dir[0])
+        )
+        self.state.spine_speed = self._get_spine_speed(vehicle_pos)
+
         # Flatten the observation
         return np.array(
             [
-                self._get_vehicle_rel_angle(vehicle_pos, vehicle_dir),
-                self._get_vehicle_elev_angle(vehicle_dir),
-                self._get_vehicle_velocity(vehicle_pos),
-                electrics["rpm"],
-                electrics["throttle"],
-                electrics["brake"],
-                electrics["steering"],
-                electrics["gear_index"],
-                electrics["wheelspeed"],
-                *self._get_lidar_distances(
-                    vehicle_pos, np.arctan2(vehicle_dir[1], vehicle_dir[0])
-                ),
-                self.remaining_time,
-                self._get_remaining_track_dist(vehicle_pos),
+                self.state.vehicle_rel_angle,
+                self.state.vehicle_elev_angle,
+                self.state.vehicle_velocity,
+                self.state.rpm,
+                self.state.throttle,
+                self.state.brake,
+                self.state.steering,
+                self.state.gear_index,
+                self.state.wheelspeed,
+                *self.state.lidar_distances,
+                self.state.spine_speed,
             ],
             dtype=np.float32,
         )
@@ -229,18 +294,18 @@ class WCARaceGeometry(gym.Env):
         return np.arctan2(vehicle_dir[2], np.linalg.norm(vehicle_dir[0:2]))
 
     def _get_vehicle_velocity(self, vehicle_pos) -> float:
-        if not self.last_vehicle_pos:
-            self.last_vehicle_pos = vehicle_pos
+        if not self.state.last_vehicle_pos:
+            self.state.last_vehicle_pos = vehicle_pos
             return 0
         delta_time = 1 / self.action_rate
         velocity_vector = np.array(
             [
-                (vehicle_pos.x - self.last_vehicle_pos.x) / delta_time,
-                (vehicle_pos.y - self.last_vehicle_pos.y) / delta_time,
-                (vehicle_pos.z - self.last_vehicle_pos.z) / delta_time,
+                (vehicle_pos.x - self.state.last_vehicle_pos.x) / delta_time,
+                (vehicle_pos.y - self.state.last_vehicle_pos.y) / delta_time,
+                (vehicle_pos.z - self.state.last_vehicle_pos.z) / delta_time,
             ]
         )
-        self.last_vehicle_pos = vehicle_pos
+        self.state.last_vehicle_pos = vehicle_pos
         return np.linalg.norm(velocity_vector)
 
     def _get_remaining_track_dist(self, vehicle_pos) -> float:
@@ -248,6 +313,21 @@ class WCARaceGeometry(gym.Env):
         if curr_proj_dist < 0:
             curr_proj_dist += self.spine.length
         return self.spine.length - curr_proj_dist
+
+    def _get_spine_speed(self, vehicle_pos) -> float:
+        self.state.remaining_dist = self._get_remaining_track_dist(vehicle_pos)
+        if self.state.last_remaining_dist is not None:
+            spine_speed = (
+                self.state.last_remaining_dist - self.state.remaining_dist
+            ) / (1 / self.action_rate)
+            self.state.last_remaining_dist = min(
+                self.state.last_remaining_dist, self.state.remaining_dist
+            )
+        else:
+            spine_speed = 0
+            self.state.last_remaining_dist = self.state.remaining_dist
+
+        return spine_speed
 
     def _ray_distance(
         self,
@@ -279,17 +359,15 @@ class WCARaceGeometry(gym.Env):
         tracks = (self.l_edge, self.r_edge)
         angles = (
             np.linspace(
-                self.lidar_info["start_angle"],
-                self.lidar_info["end_angle"],
-                self.lidar_info["num_rays"],
+                self.lidar_info.start_angle,
+                self.lidar_info.end_angle,
+                self.lidar_info.num_rays,
             )
             + vehicle_angle
         )
         return np.array(
             [
-                self._ray_distance(
-                    vehicle_pos, angle, tracks, self.lidar_info["max_dist"]
-                )
+                self._ray_distance(vehicle_pos, angle, tracks, self.lidar_info.max_dist)
                 for angle in angles
             ],
             dtype=np.float32,
@@ -297,55 +375,43 @@ class WCARaceGeometry(gym.Env):
 
     def _get_reward(self, observation: np.ndarray) -> Tuple[float, bool, bool]:
         # Maximum damage
-        if self.vehicle.sensors["damage"]["damage"] > self.max_damage:
+        if self.vehicle.sensors["damage"]["damage"] > self.reward_settings.max_damage:
             print("reset: damage exceeded")
-            return self.damage_penalty, True, False
+            return self.reward_settings.damage_penalty, True, False
 
         # Out of bounds
         vehicle_pos = Point(*self.vehicle.state["pos"])
         if not self.polygon.contains(vehicle_pos):
             print("reset: out of bounds")
-            return self.out_of_bounds_penalty, True, False
+            return self.reward_settings.out_of_bounds_penalty, True, False
 
         # Wrong way
-        remaining_dist = observation[-1]
-        if (
-            self.last_remaining_dist is not None
-            and remaining_dist > self.last_remaining_dist + 0.5
-        ):
+        spine_speed = observation[-1]
+        if spine_speed < -5:
             print("reset: wrong way")
-            return self.wrong_way_penalty, True, False
+            return self.reward_settings.wrong_way_penalty, True, False
 
-        # Progress reward
-        progress_reward = 0
-        if (
-            self.last_remaining_dist is not None
-            and remaining_dist < self.last_remaining_dist
-        ):
-            progress_reward = (
-                self.last_remaining_dist - remaining_dist
-            ) * self.progress_multiplier
+        # Too long
+        if self.state.remaining_time <= 0:
+            print("reset: too long")
+            return self.reward_settings.too_long_penalty, False, True
 
-        if self.last_remaining_dist is not None:
-            self.last_remaining_dist = min(self.last_remaining_dist, remaining_dist)
-        else:
-            self.last_remaining_dist = remaining_dist
+        # Spine speed reward
+        speed_reward = 0.1 * spine_speed**2
+
+        # Steering rate punishment
+        steer_punishment = -0.1 * self.state.steering_rate**2
+
+        # Sum of rewards and punishment
+        total_reward = speed_reward + steer_punishment
 
         # Race complete
-        if remaining_dist < 20:
+        if self.state.remaining_dist < 20:
             print("race complete")
 
             # Increment start_proj but do not exceed final_proj
-            self.start_proj = min(self.start_proj + 1, self.final_proj)
+            self.start_proj = min(self.start_proj + 20, self.final_proj)
 
-            return self.completion_reward, True, False
-
-        # Too long
-        if self.remaining_time <= 0:
-            print("reset: too long")
-            return self.too_long_penalty, False, True
-
-        # Total reward
-        total_reward = progress_reward + self.time_penalty
+            return total_reward, True, False
 
         return total_reward, False, False
