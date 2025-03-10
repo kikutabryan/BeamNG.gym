@@ -18,14 +18,14 @@ class LidarSettings:
 
 @dataclass
 class RewardSettings:
-    completion_reward: float
-    progress_multiplier: float
-    time_penalty: float
     max_damage: float
     damage_penalty: float
     out_of_bounds_penalty: float
     wrong_way_penalty: float
     too_long_penalty: float
+    speed_factor: float
+    steer_factor: float
+    brake_factor: float
 
 
 @dataclass
@@ -68,14 +68,14 @@ class WCARaceGeometry(gym.Env):
 
         # Reward and penalty settings
         self.reward_settings = RewardSettings(
-            completion_reward=50,
-            progress_multiplier=0.2,
-            time_penalty=-0.1,
             max_damage=100,
             damage_penalty=-50,
             out_of_bounds_penalty=-50,
             wrong_way_penalty=-50,
             too_long_penalty=-50,
+            speed_factor=0.1,
+            steer_factor=10,
+            brake_factor=10,
         )
 
         # Track and vehicle setup
@@ -397,10 +397,15 @@ class WCARaceGeometry(gym.Env):
             return self.reward_settings.too_long_penalty, False, True
 
         # Spine speed reward
-        speed_reward = 0.1 * spine_speed**2
+        speed_reward = self.reward_settings.speed_factor * spine_speed**2
 
         # Steering rate punishment
-        steer_punishment = -0.1 * self.state.steering_rate**2
+        steer_punishment = (
+            -self.reward_settings.steer_factor * self.state.steering_rate**2
+        )
+
+        # Braking punishment
+        brake_punishment = -self.reward_settings.brake_factor * self.state.brake**2
 
         # Sum of rewards and punishment
         total_reward = speed_reward + steer_punishment
