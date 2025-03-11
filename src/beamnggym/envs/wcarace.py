@@ -6,6 +6,7 @@ from beamngpy.sensors import Damage, Electrics
 from beamngpy.misc.quat import angle_to_quat
 from shapely.geometry import LinearRing, LineString, Point, Polygon
 from dataclasses import dataclass, field
+import random
 
 
 @dataclass
@@ -30,9 +31,9 @@ class RewardSettings:
 
 @dataclass
 class EnvironmentState:
+    curr_dist: float = 0
+    last_proj: float = None
     last_vehicle_pos: Point = None
-    remaining_dist: float = None
-    last_remaining_dist: float = None
     steering_rate: float = 0
     last_steering: float = 0
     remaining_time: float = 0
@@ -52,7 +53,7 @@ class EnvironmentState:
 
 
 class WCARaceGeometry(gym.Env):
-    def __init__(self, host="localhost", port=25252):
+    def __init__(self, host="localhost", port=25252, lap_percent=1):
         # Simulation settings
         self.sim_rate = 50  # simulation steps per second
         self.action_rate = 5  # actions per second
@@ -62,7 +63,7 @@ class WCARaceGeometry(gym.Env):
         self.lidar_info = LidarSettings(
             start_angle=-np.deg2rad(135),
             end_angle=np.deg2rad(135),
-            num_rays=271,
+            num_rays=101,
             max_dist=500,
         )
 
@@ -73,24 +74,22 @@ class WCARaceGeometry(gym.Env):
             out_of_bounds_penalty=-50,
             wrong_way_penalty=-50,
             too_long_penalty=-50,
-            speed_factor=0.1,
-            steer_factor=10,
+            speed_factor=0.01,
+            steer_factor=100,
             brake_factor=10,
         )
 
         # Track and vehicle setup
-        self.start_proj = 10
-        self.final_proj = 4320
+        self.lap_percent = lap_percent
+        self.max_lap_time = 5 * 60
         self.spine = None
         self.l_edge = None
         self.r_edge = None
         self.polygon = None
-        self.steering_rate_factor = 0.5
+        self.steering_rate_factor = 0.2
 
         # Initialize state
-        self.state = EnvironmentState(
-            remaining_time=10 * 60 * (self.start_proj / self.final_proj)
-        )
+        self.state = EnvironmentState()
 
         # Define action and observation spaces
         self.action_space = self._action_space()
@@ -108,16 +107,33 @@ class WCARaceGeometry(gym.Env):
         self.bng.control.pause()
         self._configure_simulation()
 
+        # Initialize simulation
+        self._initialize_simulation()
+
     def __del__(self):
         self.bng.close()
+
+    def _initialize_simulation(self):
+        # Set states
+        self.state.remaining_time = self.max_lap_time * self.lap_percent + 10
+        self.state.curr_dist = 0  # Reset current distance
+
+        # BeamNG config
+        self.vehicle.control(throttle=0.0, brake=0.0, steering=0.0)
+        self.bng.scenario.restart()
+        self.bng.control.step(30)
+        self.bng.control.pause()
+        self.vehicle.set_shift_mode("realistic_automatic")
+        self.vehicle.control(gear=2)
+        self.vehicle.sensors.poll()
 
     def _setup_vehicle(self) -> Vehicle:
         vehicle = Vehicle(
             "racecar",
-            model="sunburst",
+            model="etk800",
             license="BEAMNG",
-            color="red",
-            part_config="vehicles/sunburst/hillclimb.pc",
+            color="white",
+            part_config="vehicles/etk800/856x_310d_A.pc",
         )
         vehicle.sensors.attach("electrics", Electrics())
         vehicle.sensors.attach("damage", Damage())
@@ -207,16 +223,26 @@ class WCARaceGeometry(gym.Env):
 
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed, options=options)
-        self.state.remaining_time = 5 * 60 * (self.start_proj / self.final_proj) + 10
-        self.state.last_remaining_dist = None
-        self.state.last_vehicle_pos = None
-        self.vehicle.control(throttle=0.0, brake=0.0, steering=0.0)
-        self.bng.scenario.restart()
-        self.bng.control.step(30)
-        self.bng.control.pause()
-        self.vehicle.set_shift_mode("realistic_automatic")
-        self.vehicle.control(gear=2)
-        self.vehicle.sensors.poll()
+        # Get random point on spine
+        self.state.last_proj = random.uniform(0, self.spine.length)
+        self.state.last_vehicle_pos = self.spine.interpolate(self.state.last_proj)
+
+        # Get angle of spine at point
+        start_angle = self._get_spine_angle(self.state.last_vehicle_pos)
+
+        # Random offset
+        random_offset = (random.uniform(-2, 2), random.uniform(-2, 2), 0)
+
+        # Randomize starting position
+        start_pos = (
+            self.state.last_vehicle_pos.x + random_offset[0],
+            self.state.last_vehicle_pos.y + random_offset[1],
+            self.state.last_vehicle_pos.z + 0.5,
+        )
+        self.vehicle.teleport(
+            pos=start_pos, rot_quat=angle_to_quat((0, 0, np.rad2deg(-start_angle) - 90))
+        )
+        self._initialize_simulation()
         return self._get_obs(), {}
 
     def _update(self, action):
@@ -282,13 +308,17 @@ class WCARaceGeometry(gym.Env):
         )
 
     def _get_vehicle_rel_angle(self, vehicle_pos, vehicle_dir) -> float:
-        spine_proj_dist = self.spine.project(vehicle_pos)
-        spine_proj = self.spine.interpolate(spine_proj_dist)
-        spine_end = self.spine.interpolate(spine_proj_dist + 1)
-        spine_angle = np.arctan2(spine_end.y - spine_proj.y, spine_end.x - spine_proj.x)
+        spine_angle = self._get_spine_angle(vehicle_pos)
         vehicle_angle = np.arctan2(vehicle_dir[1], vehicle_dir[0])
         rel_angle = (vehicle_angle - spine_angle + np.pi) % (2 * np.pi) - np.pi
         return rel_angle
+
+    def _get_spine_angle(self, position) -> float:
+        spine_proj_dist = self.spine.project(position)
+        spine_fwd = self.spine.interpolate((spine_proj_dist + 1) % self.spine.length)
+        spine_bwd = self.spine.interpolate((spine_proj_dist - 1) % self.spine.length)
+        spine_angle = np.arctan2(spine_fwd.y - spine_bwd.y, spine_fwd.x - spine_bwd.x)
+        return spine_angle
 
     def _get_vehicle_elev_angle(self, vehicle_dir) -> float:
         return np.arctan2(vehicle_dir[2], np.linalg.norm(vehicle_dir[0:2]))
@@ -308,25 +338,29 @@ class WCARaceGeometry(gym.Env):
         self.state.last_vehicle_pos = vehicle_pos
         return np.linalg.norm(velocity_vector)
 
-    def _get_remaining_track_dist(self, vehicle_pos) -> float:
-        curr_proj_dist = self.spine.project(vehicle_pos) - self.start_proj
-        if curr_proj_dist < 0:
-            curr_proj_dist += self.spine.length
-        return self.spine.length - curr_proj_dist
+    def _get_spine_dist(self, vehicle_pos) -> float:
+        curr_proj = self.spine.project(vehicle_pos)
+        dist = curr_proj - self.state.last_proj
+        self.state.last_proj = curr_proj
+
+        # Check if distance is valid
+        if abs(dist) > 0.9 * self.spine.length:
+            if dist < 0:
+                # Passed end point
+                dist += self.spine.length
+            elif dist > 0:
+                # Went behind start
+                dist -= self.spine.length
+
+        # Update distance covered
+        self.state.curr_dist += dist
+
+        return dist
 
     def _get_spine_speed(self, vehicle_pos) -> float:
-        self.state.remaining_dist = self._get_remaining_track_dist(vehicle_pos)
-        if self.state.last_remaining_dist is not None:
-            spine_speed = (
-                self.state.last_remaining_dist - self.state.remaining_dist
-            ) / (1 / self.action_rate)
-            self.state.last_remaining_dist = min(
-                self.state.last_remaining_dist, self.state.remaining_dist
-            )
-        else:
-            spine_speed = 0
-            self.state.last_remaining_dist = self.state.remaining_dist
-
+        dist = self._get_spine_dist(vehicle_pos)
+        time_step = 1 / self.action_rate
+        spine_speed = dist / time_step
         return spine_speed
 
     def _ray_distance(
@@ -397,26 +431,21 @@ class WCARaceGeometry(gym.Env):
             return self.reward_settings.too_long_penalty, False, True
 
         # Spine speed reward
-        speed_reward = self.reward_settings.speed_factor * spine_speed**2
+        speed_reward = (
+            self.reward_settings.speed_factor * np.sign(spine_speed) * spine_speed**2
+        )
 
         # Steering rate punishment
         steer_punishment = (
             -self.reward_settings.steer_factor * self.state.steering_rate**2
         )
 
-        # Braking punishment
-        brake_punishment = -self.reward_settings.brake_factor * self.state.brake**2
-
         # Sum of rewards and punishment
         total_reward = speed_reward + steer_punishment
 
         # Race complete
-        if self.state.remaining_dist < 20:
+        if self.state.curr_dist > self.spine.length * self.lap_percent:
             print("race complete")
-
-            # Increment start_proj but do not exceed final_proj
-            self.start_proj = min(self.start_proj + 20, self.final_proj)
-
             return total_reward, True, False
 
         return total_reward, False, False
