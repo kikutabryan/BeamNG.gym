@@ -48,26 +48,86 @@ class EnvironmentState:
     steering: float = 0
     gear_index: int = 0
     wheelspeed: float = 0
-    rel_angle_history: deque = field(default_factory=lambda: deque(maxlen=5))
-    steering_history: deque = field(default_factory=lambda: deque(maxlen=5))
-    velocity_history: deque = field(default_factory=lambda: deque(maxlen=5))
-    throttle_history: deque = field(default_factory=lambda: deque(maxlen=5))
+    rel_angle_history: deque = field(default_factory=deque)
+    steering_history: deque = field(default_factory=deque)
+    velocity_history: deque = field(default_factory=deque)
+    throttle_history: deque = field(default_factory=deque)
     lidar_distances: np.ndarray = field(
         default_factory=lambda: np.zeros(271, dtype=np.float32)
     )
 
 
 class WCARaceGeometry(gym.Env):
-    def __init__(self, host="localhost", port=25252, lap_percent=1, real_time=False):
+    def __init__(
+        self,
+        host="localhost",
+        port=25252,
+        lap_percent=1,
+        real_time=False,
+        vehicle_index=0,
+    ):
         # Simulation settings
         self.sim_rate = 20  # simulation steps per second
-        self.action_rate = 10  # actions per second
+        self.action_rate = 5  # actions per second
         self.steps = self.sim_rate // self.action_rate
         self.real_time = real_time
-        history_time = 5  # seconds
+        history_time = 1  # seconds
         self.history_size = (
             history_time * self.action_rate
         )  # Number of past values to keep in history queues
+
+        # Define available vehicles
+        self.vehicles = [
+            {
+                "name": "ETK 800",
+                "model": "etk800",
+                "part_config": "vehicles/etk800/856x_310d_A.pc",
+                "color": "white",
+            },
+            {
+                "name": "Bruckell LeGran",
+                "model": "legran",
+                "part_config": "vehicles/legran/sport_se_v6_awd_facelift_A.pc",
+                "color": "white",
+            },
+            {
+                "name": "Bruckell Bastion",
+                "model": "bastion",
+                "part_config": "vehicles/bastion/sport_gt_A.pc",
+                "color": "black",
+            },
+            {
+                "name": "Gavril H-Series",
+                "model": "van",
+                "part_config": "vehicles/van/h15_ext_vanster.pc",
+                "color": "white",
+            },
+            {
+                "name": "Gavril T-Series",
+                "model": "us_semi",
+                "part_config": "vehicles/us_semi/tc82s_cargobox.pc",
+                "color": "white",
+            },
+            {
+                "name": "Wentward DT40L",
+                "model": "citybus",
+                "part_config": "vehicles/citybus/highway.pc",
+                "color": "white",
+            },
+            {
+                "name": "ETK K-Series",
+                "model": "etkc",
+                "part_config": "vehicles/etkc/kc6x_trackday_A.pc",
+                "color": "white",
+            },
+        ]
+
+        # Validate and set vehicle index
+        if vehicle_index < 0 or vehicle_index >= len(self.vehicles):
+            print(f"Invalid vehicle index {vehicle_index}, using default vehicle 0")
+            self.vehicle_index = 0
+        else:
+            self.vehicle_index = vehicle_index
 
         # LiDAR settings
         self.lidar_info = LidarSettings(
@@ -79,7 +139,7 @@ class WCARaceGeometry(gym.Env):
 
         # Reward and penalty settings
         self.reward_settings = RewardSettings(
-            max_damage=100,
+            max_damage=500,
             damage_penalty=-250,
             out_of_bounds_penalty=-250,
             wrong_way_penalty=-250,
@@ -100,6 +160,12 @@ class WCARaceGeometry(gym.Env):
 
         # Initialize state
         self.state = EnvironmentState()
+
+        # Set maxlen for history deques
+        self.state.rel_angle_history = deque(maxlen=self.history_size)
+        self.state.steering_history = deque(maxlen=self.history_size)
+        self.state.velocity_history = deque(maxlen=self.history_size)
+        self.state.throttle_history = deque(maxlen=self.history_size)
 
         # Initialize history queues with zeros
         for _ in range(self.history_size):
@@ -142,6 +208,13 @@ class WCARaceGeometry(gym.Env):
         self.state.steering_history.clear()
         self.state.velocity_history.clear()
         self.state.throttle_history.clear()
+
+        # Ensure correct maxlen
+        self.state.rel_angle_history = deque(maxlen=self.history_size)
+        self.state.steering_history = deque(maxlen=self.history_size)
+        self.state.velocity_history = deque(maxlen=self.history_size)
+        self.state.throttle_history = deque(maxlen=self.history_size)
+
         for _ in range(self.history_size):
             self.state.rel_angle_history.append(0.0)
             self.state.steering_history.append(0.0)
@@ -158,12 +231,15 @@ class WCARaceGeometry(gym.Env):
         self.vehicle.sensors.poll()
 
     def _setup_vehicle(self) -> Vehicle:
+        vehicle_config = self.vehicles[self.vehicle_index]
+        print(f"Using vehicle: {vehicle_config['name']}")
+
         vehicle = Vehicle(
             "racecar",
-            model="etk800",
+            model=vehicle_config["model"],
             license="BEAMNG",
-            color="white",
-            part_config="vehicles/etk800/856x_310d_A.pc",
+            color=vehicle_config["color"],
+            part_config=vehicle_config["part_config"],
         )
         vehicle.sensors.attach("electrics", Electrics())
         vehicle.sensors.attach("damage", Damage())
@@ -297,7 +373,7 @@ class WCARaceGeometry(gym.Env):
             np.clip(self.state.last_steering + self.state.steering_rate, -1, 1)
         )
         self.state.last_steering = steering
-
+        print(f"Throttle: {throttle:.2f}, Brake: {brake:.2f}, Steering: {steering:.2f}")
         self.vehicle.control(steering=steering, throttle=throttle, brake=brake)
         self.bng.step(self.steps, wait=True)
         self.state.remaining_time -= 1 / self.action_rate
