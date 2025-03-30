@@ -50,6 +50,8 @@ class EnvironmentState:
     wheelspeed: float = 0
     rel_angle_history: deque = field(default_factory=lambda: deque(maxlen=5))
     steering_history: deque = field(default_factory=lambda: deque(maxlen=5))
+    velocity_history: deque = field(default_factory=lambda: deque(maxlen=5))
+    throttle_history: deque = field(default_factory=lambda: deque(maxlen=5))
     lidar_distances: np.ndarray = field(
         default_factory=lambda: np.zeros(271, dtype=np.float32)
     )
@@ -103,6 +105,8 @@ class WCARaceGeometry(gym.Env):
         for _ in range(self.history_size):
             self.state.rel_angle_history.append(0.0)
             self.state.steering_history.append(0.0)
+            self.state.velocity_history.append(0.0)
+            self.state.throttle_history.append(0.0)
 
         # Define action and observation spaces
         self.action_space = self._action_space()
@@ -136,9 +140,13 @@ class WCARaceGeometry(gym.Env):
         # Reset history queues
         self.state.rel_angle_history.clear()
         self.state.steering_history.clear()
+        self.state.velocity_history.clear()
+        self.state.throttle_history.clear()
         for _ in range(self.history_size):
             self.state.rel_angle_history.append(0.0)
             self.state.steering_history.append(0.0)
+            self.state.velocity_history.append(0.0)
+            self.state.throttle_history.append(0.0)
 
         # BeamNG config
         self.vehicle.control(throttle=0.0, brake=0.0, steering=0.0)
@@ -190,9 +198,9 @@ class WCARaceGeometry(gym.Env):
                 [
                     *[-np.pi] * self.history_size,  # Relative angle history queue
                     -np.pi,  # Elevation angle
-                    -np.inf,  # Vehicle velocity
+                    *[-np.inf] * self.history_size,  # Vehicle velocity history queue
                     0,  # RPM
-                    0,  # Throttle
+                    *[0] * self.history_size,  # Throttle history queue
                     0,  # Brake
                     *[-1.0] * self.history_size,  # Steering history queue
                     -1,  # Gear index
@@ -206,9 +214,9 @@ class WCARaceGeometry(gym.Env):
                 [
                     *[np.pi] * self.history_size,  # Relative angle history queue
                     np.pi,  # Elevation angle
-                    np.inf,  # Vehicle velocity
+                    *[np.inf] * self.history_size,  # Vehicle velocity history queue
                     np.inf,  # RPM
-                    1.0,  # Throttle
+                    *[1.0] * self.history_size,  # Throttle history queue
                     1.0,  # Brake
                     *[1.0] * self.history_size,  # Steering history queue
                     8,  # Gear index
@@ -321,13 +329,15 @@ class WCARaceGeometry(gym.Env):
         # Update history queues
         rel_angle = np.clip(self.state.vehicle_rel_angle, -np.pi, np.pi)
         steering = np.clip(self.state.steering, -1.0, 1.0)
+        throttle = np.clip(self.state.throttle, 0, 1.0)
 
         self.state.rel_angle_history.append(rel_angle)
         self.state.steering_history.append(steering)
+        self.state.velocity_history.append(self.state.vehicle_velocity)
+        self.state.throttle_history.append(throttle)
 
         # Ensure other values stay within observation bounds
         elev_angle = np.clip(self.state.vehicle_elev_angle, -np.pi, np.pi)
-        throttle = np.clip(self.state.throttle, 0, 1.0)
         brake = np.clip(self.state.brake, 0, 1.0)
         gear_index = np.clip(self.state.gear_index, -1, 8)
 
@@ -341,9 +351,9 @@ class WCARaceGeometry(gym.Env):
             [
                 *list(self.state.rel_angle_history),  # Relative angle history queue
                 elev_angle,
-                self.state.vehicle_velocity,
+                *list(self.state.velocity_history),  # Vehicle velocity history queue
                 self.state.rpm,
-                throttle,
+                *list(self.state.throttle_history),  # Throttle history queue
                 brake,
                 *list(self.state.steering_history),  # Steering history queue
                 gear_index,
