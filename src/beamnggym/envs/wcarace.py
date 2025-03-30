@@ -7,6 +7,7 @@ from beamngpy.misc.quat import angle_to_quat
 from shapely.geometry import LinearRing, LineString, Point, Polygon
 from dataclasses import dataclass, field
 import random
+from collections import deque
 
 
 @dataclass
@@ -47,6 +48,8 @@ class EnvironmentState:
     steering: float = 0
     gear_index: int = 0
     wheelspeed: float = 0
+    rel_angle_history: deque = field(default_factory=lambda: deque(maxlen=5))
+    steering_history: deque = field(default_factory=lambda: deque(maxlen=5))
     lidar_distances: np.ndarray = field(
         default_factory=lambda: np.zeros(271, dtype=np.float32)
     )
@@ -59,6 +62,10 @@ class WCARaceGeometry(gym.Env):
         self.action_rate = 10  # actions per second
         self.steps = self.sim_rate // self.action_rate
         self.real_time = real_time
+        history_time = 5  # seconds
+        self.history_size = (
+            history_time * self.action_rate
+        )  # Number of past values to keep in history queues
 
         # LiDAR settings
         self.lidar_info = LidarSettings(
@@ -92,6 +99,11 @@ class WCARaceGeometry(gym.Env):
         # Initialize state
         self.state = EnvironmentState()
 
+        # Initialize history queues with zeros
+        for _ in range(self.history_size):
+            self.state.rel_angle_history.append(0.0)
+            self.state.steering_history.append(0.0)
+
         # Define action and observation spaces
         self.action_space = self._action_space()
         self.observation_space = self._observation_space()
@@ -120,6 +132,13 @@ class WCARaceGeometry(gym.Env):
         # Set states
         self.state.remaining_time = self.max_lap_time * self.lap_percent + 10
         self.state.curr_dist = 0  # Reset current distance
+
+        # Reset history queues
+        self.state.rel_angle_history.clear()
+        self.state.steering_history.clear()
+        for _ in range(self.history_size):
+            self.state.rel_angle_history.append(0.0)
+            self.state.steering_history.append(0.0)
 
         # BeamNG config
         self.vehicle.control(throttle=0.0, brake=0.0, steering=0.0)
@@ -169,13 +188,13 @@ class WCARaceGeometry(gym.Env):
         return gym.spaces.Box(
             low=np.array(
                 [
-                    -np.pi,  # Relative angle
+                    *[-np.pi] * self.history_size,  # Relative angle history queue
                     -np.pi,  # Elevation angle
                     -np.inf,  # Vehicle velocity
                     0,  # RPM
                     0,  # Throttle
                     0,  # Brake
-                    -1.0,  # Steering
+                    *[-1.0] * self.history_size,  # Steering history queue
                     -1,  # Gear index
                     0,  # Wheelspeed
                     *[0] * self.lidar_info.num_rays,  # LiDAR
@@ -185,13 +204,13 @@ class WCARaceGeometry(gym.Env):
             ),
             high=np.array(
                 [
-                    np.pi,  # Relative angle
+                    *[np.pi] * self.history_size,  # Relative angle history queue
                     np.pi,  # Elevation angle
                     np.inf,  # Vehicle velocity
                     np.inf,  # RPM
                     1.0,  # Throttle
                     1.0,  # Brake
-                    1.0,  # Steering
+                    *[1.0] * self.history_size,  # Steering history queue
                     8,  # Gear index
                     np.inf,  # Wheelspeed
                     *[self.lidar_info.max_dist] * self.lidar_info.num_rays,  # LiDAR
@@ -299,12 +318,17 @@ class WCARaceGeometry(gym.Env):
         )
         self.state.spine_speed = self._get_spine_speed(vehicle_pos)
 
-        # Ensure values stay within observation bounds
+        # Update history queues
         rel_angle = np.clip(self.state.vehicle_rel_angle, -np.pi, np.pi)
+        steering = np.clip(self.state.steering, -1.0, 1.0)
+
+        self.state.rel_angle_history.append(rel_angle)
+        self.state.steering_history.append(steering)
+
+        # Ensure other values stay within observation bounds
         elev_angle = np.clip(self.state.vehicle_elev_angle, -np.pi, np.pi)
         throttle = np.clip(self.state.throttle, 0, 1.0)
         brake = np.clip(self.state.brake, 0, 1.0)
-        steering = np.clip(self.state.steering, -1.0, 1.0)
         gear_index = np.clip(self.state.gear_index, -1, 8)
 
         # Ensure LiDAR values are within bounds
@@ -315,13 +339,13 @@ class WCARaceGeometry(gym.Env):
         # Flatten the observation
         return np.array(
             [
-                rel_angle,
+                *list(self.state.rel_angle_history),  # Relative angle history queue
                 elev_angle,
                 self.state.vehicle_velocity,
                 self.state.rpm,
                 throttle,
                 brake,
-                steering,
+                *list(self.state.steering_history),  # Steering history queue
                 gear_index,
                 self.state.wheelspeed,
                 *lidar_distances,
