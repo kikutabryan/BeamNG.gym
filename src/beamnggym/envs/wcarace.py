@@ -53,11 +53,12 @@ class EnvironmentState:
 
 
 class WCARaceGeometry(gym.Env):
-    def __init__(self, host="localhost", port=25252, lap_percent=1):
+    def __init__(self, host="localhost", port=25252, lap_percent=1, real_time=False):
         # Simulation settings
-        self.sim_rate = 50  # simulation steps per second
-        self.action_rate = 5  # actions per second
+        self.sim_rate = 20  # simulation steps per second
+        self.action_rate = 10  # actions per second
         self.steps = self.sim_rate // self.action_rate
+        self.real_time = real_time
 
         # LiDAR settings
         self.lidar_info = LidarSettings(
@@ -70,13 +71,13 @@ class WCARaceGeometry(gym.Env):
         # Reward and penalty settings
         self.reward_settings = RewardSettings(
             max_damage=100,
-            damage_penalty=-50,
-            out_of_bounds_penalty=-50,
-            wrong_way_penalty=-50,
-            too_long_penalty=-50,
+            damage_penalty=-250,
+            out_of_bounds_penalty=-250,
+            wrong_way_penalty=-250,
+            too_long_penalty=-250,
             speed_factor=0.01,
-            steer_factor=100,
-            brake_factor=10,
+            steer_factor=200,
+            brake_factor=5,
         )
 
         # Track and vehicle setup
@@ -105,7 +106,6 @@ class WCARaceGeometry(gym.Env):
         # Start and configure simulation
         self.bng.scenario.start()
         self.bng.control.pause()
-        self._configure_simulation()
 
         # Initialize simulation
         self._initialize_simulation()
@@ -114,6 +114,9 @@ class WCARaceGeometry(gym.Env):
         self.bng.close()
 
     def _initialize_simulation(self):
+        # Set simulation speed
+        self._configure_simulation()
+
         # Set states
         self.state.remaining_time = self.max_lap_time * self.lap_percent + 10
         self.state.curr_dist = 0  # Reset current distance
@@ -151,14 +154,15 @@ class WCARaceGeometry(gym.Env):
         return scenario
 
     def _configure_simulation(self):
-        self.bng.settings.set_deterministic(self.sim_rate)
         self.bng.control.queue_lua_command("be:setPhysicsDeterministic(true)")
-        self.bng.control.queue_lua_command(
-            'be:executeJS("bngApi.engine.setFrameLimiter(false)")'
-        )
+        if self.real_time:
+            self.bng.control.queue_lua_command(f"Engine.setFPSLimiter({self.sim_rate})")
+            self.bng.control.queue_lua_command("Engine.setFPSLimiterEnabled(true)")
+        else:
+            self.bng.control.queue_lua_command("Engine.setFPSLimiterEnabled(false)")
 
     def _action_space(self):
-        return gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float64)
+        return gym.spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
 
     def _observation_space(self):
         # Flatten the observation space
@@ -176,7 +180,8 @@ class WCARaceGeometry(gym.Env):
                     0,  # Wheelspeed
                     *[0] * self.lidar_info.num_rays,  # LiDAR
                     -np.inf,  # Spine speed
-                ]
+                ],
+                dtype=np.float32,
             ),
             high=np.array(
                 [
@@ -191,9 +196,10 @@ class WCARaceGeometry(gym.Env):
                     np.inf,  # Wheelspeed
                     *[self.lidar_info.max_dist] * self.lidar_info.num_rays,  # LiDAR
                     np.inf,  # Spine speed
-                ]
+                ],
+                dtype=np.float32,
             ),
-            dtype=np.float64,
+            dtype=np.float32,
         )
 
     def _build_racetrack(self):
@@ -231,16 +237,20 @@ class WCARaceGeometry(gym.Env):
         start_angle = self._get_spine_angle(self.state.last_vehicle_pos)
 
         # Random offset
-        random_offset = (random.uniform(-2, 2), random.uniform(-2, 2), 0)
+        random_pos_offset = (random.uniform(-2, 2), random.uniform(-2, 2), 0)
+        random_angle_offest = random.uniform(-20, 20)
 
         # Randomize starting position
         start_pos = (
-            self.state.last_vehicle_pos.x + random_offset[0],
-            self.state.last_vehicle_pos.y + random_offset[1],
+            self.state.last_vehicle_pos.x + random_pos_offset[0],
+            self.state.last_vehicle_pos.y + random_pos_offset[1],
             self.state.last_vehicle_pos.z + 0.5,
         )
         self.vehicle.teleport(
-            pos=start_pos, rot_quat=angle_to_quat((0, 0, np.rad2deg(-start_angle) - 90))
+            pos=start_pos,
+            rot_quat=angle_to_quat(
+                (0, 0, np.rad2deg(-start_angle) - 90 + random_angle_offest)
+            ),
         )
         self._initialize_simulation()
         return self._get_obs(), {}
@@ -249,8 +259,8 @@ class WCARaceGeometry(gym.Env):
         action = [*np.clip(action, -1, 1)]
         action = [float(act) for act in action]
         throttle, self.state.steering_rate = (
-            action[0],
-            action[1] * self.steering_rate_factor,
+            float(action[0]),
+            float(action[1] * self.steering_rate_factor),
         )
         brake = -throttle if throttle < 0 else 0
         throttle = max(throttle, 0)
@@ -289,19 +299,32 @@ class WCARaceGeometry(gym.Env):
         )
         self.state.spine_speed = self._get_spine_speed(vehicle_pos)
 
+        # Ensure values stay within observation bounds
+        rel_angle = np.clip(self.state.vehicle_rel_angle, -np.pi, np.pi)
+        elev_angle = np.clip(self.state.vehicle_elev_angle, -np.pi, np.pi)
+        throttle = np.clip(self.state.throttle, 0, 1.0)
+        brake = np.clip(self.state.brake, 0, 1.0)
+        steering = np.clip(self.state.steering, -1.0, 1.0)
+        gear_index = np.clip(self.state.gear_index, -1, 8)
+
+        # Ensure LiDAR values are within bounds
+        lidar_distances = np.clip(
+            self.state.lidar_distances, 0, self.lidar_info.max_dist
+        )
+
         # Flatten the observation
         return np.array(
             [
-                self.state.vehicle_rel_angle,
-                self.state.vehicle_elev_angle,
+                rel_angle,
+                elev_angle,
                 self.state.vehicle_velocity,
                 self.state.rpm,
-                self.state.throttle,
-                self.state.brake,
-                self.state.steering,
-                self.state.gear_index,
+                throttle,
+                brake,
+                steering,
+                gear_index,
                 self.state.wheelspeed,
-                *self.state.lidar_distances,
+                *lidar_distances,
                 self.state.spine_speed,
             ],
             dtype=np.float32,
@@ -439,6 +462,9 @@ class WCARaceGeometry(gym.Env):
         steer_punishment = (
             -self.reward_settings.steer_factor * self.state.steering_rate**2
         )
+
+        # Braking punishment
+        # brake_punishment = -self.reward_settings.brake_factor * self.state.brake**2
 
         # Sum of rewards and punishment
         total_reward = speed_reward + steer_punishment
