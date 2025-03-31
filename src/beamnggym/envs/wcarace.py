@@ -27,7 +27,6 @@ class RewardSettings:
     too_long_penalty: float
     speed_factor: float
     steer_factor: float
-    brake_factor: float
 
 
 @dataclass
@@ -68,6 +67,7 @@ class WCARaceGeometry(gym.Env):
         learn_starts=0,
         real_time=False,
         vehicle_index=0,
+        randomize_start=False,
     ):
         # Progressive difficulty settings
         self.final_lap_percent = final_lap_percent
@@ -75,6 +75,7 @@ class WCARaceGeometry(gym.Env):
         self.current_lap_percent = start_lap_percent
         self.learn_starts = learn_starts
         self.total_steps = 0
+        self.randomize_start = randomize_start
 
         # Simulation settings
         self.sim_rate = 20  # simulation steps per second
@@ -86,9 +87,13 @@ class WCARaceGeometry(gym.Env):
             history_time * self.action_rate
         )  # Number of past values to keep in history queues
 
+        # Define default start position and rotation
+        self.default_pos = (394.5, -247.925, 145.25)
+        self.default_rot = angle_to_quat((0, 0, 90))
+
         # Spawn settings
         self.random_position_range = (
-            3.0  # Maximum random offset in x,y coordinates (meters)
+            2.5  # Maximum random offset in x,y coordinates (meters)
         )
         self.random_angle_range = (
             20.0  # Maximum random offset in rotation angle (degrees)
@@ -164,8 +169,7 @@ class WCARaceGeometry(gym.Env):
             wrong_way_penalty=-250,
             too_long_penalty=-250,
             speed_factor=0.01,
-            steer_factor=200,
-            brake_factor=5,
+            steer_factor=0.5,
         )
 
         # Track and vehicle setup
@@ -174,7 +178,7 @@ class WCARaceGeometry(gym.Env):
         self.l_edge = None
         self.r_edge = None
         self.polygon = None
-        self.steering_rate_factor = 0.2
+        self.max_steer_rate = 0.2
 
         # Initialize state
         self.state = EnvironmentState()
@@ -218,7 +222,7 @@ class WCARaceGeometry(gym.Env):
         self._configure_simulation()
 
         # Set states
-        self.state.remaining_time = self.max_lap_time * self.current_lap_percent + 10
+        self.state.remaining_time = self.max_lap_time * self.current_lap_percent + 30
         self.state.curr_dist = 0  # Reset current distance
 
         # Reset history queues
@@ -267,8 +271,8 @@ class WCARaceGeometry(gym.Env):
         scenario = Scenario("west_coast_usa", "wca_race_geometry_v0")
         scenario.add_vehicle(
             self.vehicle,
-            pos=(394.5, -247.925, 145.25),
-            rot_quat=angle_to_quat((0, 0, 90)),
+            pos=self.default_pos,
+            rot_quat=self.default_rot,
         )
         scenario.make(self.bng)
         self.bng.scenario.load(scenario)
@@ -351,35 +355,45 @@ class WCARaceGeometry(gym.Env):
 
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed, options=options)
-        # Get random point on spine
-        self.state.last_proj = random.uniform(0, self.spine.length)
-        self.state.last_vehicle_pos = self.spine.interpolate(self.state.last_proj)
 
-        # Get angle of spine at point
-        start_angle = self._get_spine_angle(self.state.last_vehicle_pos)
+        if self.randomize_start:
+            # Get random point on spine
+            self.state.last_proj = random.uniform(0, self.spine.length)
+            self.state.last_vehicle_pos = self.spine.interpolate(self.state.last_proj)
 
-        # Random offset
-        random_pos_offset = (
-            random.uniform(-self.random_position_range, self.random_position_range),
-            random.uniform(-self.random_position_range, self.random_position_range),
-            0,
-        )
-        random_angle_offest = random.uniform(
-            -self.random_angle_range, self.random_angle_range
-        )
+            # Get angle of spine at point
+            start_angle = self._get_spine_angle(self.state.last_vehicle_pos)
 
-        # Randomize starting position
-        start_pos = (
-            self.state.last_vehicle_pos.x + random_pos_offset[0],
-            self.state.last_vehicle_pos.y + random_pos_offset[1],
-            self.state.last_vehicle_pos.z + self.spawn_height_offset,
-        )
-        self.vehicle.teleport(
-            pos=start_pos,
-            rot_quat=angle_to_quat(
+            # Random offset
+            random_pos_offset = (
+                random.uniform(-self.random_position_range, self.random_position_range),
+                random.uniform(-self.random_position_range, self.random_position_range),
+                0,
+            )
+            random_angle_offest = random.uniform(
+                -self.random_angle_range, self.random_angle_range
+            )
+
+            # Randomize starting position
+            start_pos = (
+                self.state.last_vehicle_pos.x + random_pos_offset[0],
+                self.state.last_vehicle_pos.y + random_pos_offset[1],
+                self.state.last_vehicle_pos.z + self.spawn_height_offset,
+            )
+            rot_quat = angle_to_quat(
                 (0, 0, np.rad2deg(-start_angle) - 90 + random_angle_offest)
-            ),
-        )
+            )
+        else:
+            # Use the fixed starting position from _setup_scenario
+            start_pos = self.default_pos
+            rot_quat = self.default_rot
+
+            # Initialize self.state.last_proj and self.state.last_vehicle_pos
+            self.state.last_vehicle_pos = Point(*start_pos)
+            self.state.last_proj = self.spine.project(self.state.last_vehicle_pos)
+
+        # Teleport the vehicle to the starting position
+        self.vehicle.teleport(pos=start_pos, rot_quat=rot_quat)
         self._initialize_simulation()
         return self._get_obs(), {}
 
@@ -388,7 +402,7 @@ class WCARaceGeometry(gym.Env):
         action = [float(act) for act in action]
         throttle, self.state.steering_rate = (
             float(action[0]),
-            float(action[1] * self.steering_rate_factor),
+            float(action[1] * self.max_steer_rate),
         )
         brake = -throttle if throttle < 0 else 0
         throttle = max(throttle, 0)
@@ -589,24 +603,29 @@ class WCARaceGeometry(gym.Env):
             return self.reward_settings.too_long_penalty, False, True
 
         # Spine speed reward
-        speed_reward = (
-            self.reward_settings.speed_factor * np.sign(spine_speed) * spine_speed**2
+        # x^2 + x used as base function as x^2 alone would not provide enough reward
+        # and x would not incentivize going faster, as integrating x for the track
+        # would be proportional to track length.
+        speed_reward = self.reward_settings.speed_factor * (
+            np.sign(spine_speed) * spine_speed**2 + spine_speed
         )
 
         # Steering rate punishment
+        # Punishment is quadratic wrt steering rate, and proportional to speed reward.
+        # Designed to not exceed speed reward so that there is always a reward for
+        # progressing along the track, stops converging at local optimum.
         steer_punishment = (
-            -self.reward_settings.steer_factor * self.state.steering_rate**2
+            -speed_reward
+            * self.reward_settings.steer_factor
+            * (self.state.steering_rate**2 / self.max_steer_rate**2)
         )
-
-        # Braking punishment
-        # brake_punishment = -self.reward_settings.brake_factor * self.state.brake**2
 
         # Sum of rewards and punishment
         total_reward = speed_reward + steer_punishment
 
         # Race complete
         if self.state.curr_dist > self.spine.length * self.current_lap_percent:
-            print(f"race complete at {self.current_lap_percent:.2f} lap percent")
+            print(f"race complete at {self.current_lap_percent:.3f} lap percent")
 
             # Increase lap percent for progressive difficulty only after learn_starts
             if (
@@ -617,7 +636,7 @@ class WCARaceGeometry(gym.Env):
                     self.current_lap_percent + self.lap_percent_increment,
                     self.final_lap_percent,
                 )
-                print(f"increasing to {self.current_lap_percent:.2f} lap percent")
+                print(f"increasing to {self.current_lap_percent:.3f} lap percent")
             else:
                 if self.total_steps <= self.learn_starts:
                     print(
