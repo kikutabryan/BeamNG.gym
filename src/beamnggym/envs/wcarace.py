@@ -76,6 +76,15 @@ class WCARaceGeometry(gym.Env):
             history_time * self.action_rate
         )  # Number of past values to keep in history queues
 
+        # Spawn settings
+        self.random_position_range = (
+            2.0  # Maximum random offset in x,y coordinates (meters)
+        )
+        self.random_angle_range = (
+            20.0  # Maximum random offset in rotation angle (degrees)
+        )
+        self.spawn_height_offset = 0.6  # Height offset from track surface (meters)
+
         # Define available vehicles
         self.vehicles = [
             {
@@ -341,14 +350,20 @@ class WCARaceGeometry(gym.Env):
         start_angle = self._get_spine_angle(self.state.last_vehicle_pos)
 
         # Random offset
-        random_pos_offset = (random.uniform(-2, 2), random.uniform(-2, 2), 0)
-        random_angle_offest = random.uniform(-20, 20)
+        random_pos_offset = (
+            random.uniform(-self.random_position_range, self.random_position_range),
+            random.uniform(-self.random_position_range, self.random_position_range),
+            0,
+        )
+        random_angle_offest = random.uniform(
+            -self.random_angle_range, self.random_angle_range
+        )
 
         # Randomize starting position
         start_pos = (
             self.state.last_vehicle_pos.x + random_pos_offset[0],
             self.state.last_vehicle_pos.y + random_pos_offset[1],
-            self.state.last_vehicle_pos.z + 0.6,
+            self.state.last_vehicle_pos.z + self.spawn_height_offset,
         )
         self.vehicle.teleport(
             pos=start_pos,
