@@ -139,7 +139,7 @@ class WCARaceGeometry(gym.Env):
 
         # Reward and penalty settings
         self.reward_settings = RewardSettings(
-            max_damage=500,
+            max_damage=1000,
             damage_penalty=-250,
             out_of_bounds_penalty=-250,
             wrong_way_penalty=-250,
@@ -224,7 +224,8 @@ class WCARaceGeometry(gym.Env):
         # BeamNG config
         self.vehicle.control(throttle=0.0, brake=0.0, steering=0.0)
         self.bng.scenario.restart()
-        self.bng.control.step(30)
+        self.bng.control.step(self.sim_rate * 0.5)
+        self.vehicle.recover()
         self.bng.control.pause()
         self.vehicle.set_shift_mode("realistic_automatic")
         self.vehicle.control(gear=2)
@@ -347,7 +348,7 @@ class WCARaceGeometry(gym.Env):
         start_pos = (
             self.state.last_vehicle_pos.x + random_pos_offset[0],
             self.state.last_vehicle_pos.y + random_pos_offset[1],
-            self.state.last_vehicle_pos.z + 0.5,
+            self.state.last_vehicle_pos.z + 0.6,
         )
         self.vehicle.teleport(
             pos=start_pos,
@@ -373,7 +374,7 @@ class WCARaceGeometry(gym.Env):
             np.clip(self.state.last_steering + self.state.steering_rate, -1, 1)
         )
         self.state.last_steering = steering
-        print(f"Throttle: {throttle:.2f}, Brake: {brake:.2f}, Steering: {steering:.2f}")
+        # print(f"Throttle: {throttle:.2f}, Brake: {brake:.2f}, Steering: {steering:.2f}")
         self.vehicle.control(steering=steering, throttle=throttle, brake=brake)
         self.bng.step(self.steps, wait=True)
         self.state.remaining_time -= 1 / self.action_rate
