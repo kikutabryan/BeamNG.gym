@@ -65,6 +65,7 @@ class WCARaceGeometry(gym.Env):
         start_lap_percent=0.05,
         final_lap_percent=1.0,
         lap_percent_increment=0.05,
+        learn_starts=0,
         real_time=False,
         vehicle_index=0,
     ):
@@ -72,6 +73,8 @@ class WCARaceGeometry(gym.Env):
         self.final_lap_percent = final_lap_percent
         self.lap_percent_increment = lap_percent_increment
         self.current_lap_percent = start_lap_percent
+        self.learn_starts = learn_starts
+        self.total_steps = 0
 
         # Simulation settings
         self.sim_rate = 20  # simulation steps per second
@@ -340,6 +343,7 @@ class WCARaceGeometry(gym.Env):
 
     def step(self, action):
         self._update(action)
+        self.total_steps += 1  # Increment total steps counter
         observation = self._get_obs()
         reward, terminated, truncated = self._get_reward(observation)
         print(f"Reward: {reward:.2f}, Terminated: {terminated}, Truncated: {truncated}")
@@ -604,13 +608,21 @@ class WCARaceGeometry(gym.Env):
         if self.state.curr_dist > self.spine.length * self.current_lap_percent:
             print(f"race complete at {self.current_lap_percent:.2f} lap percent")
 
-            # Increase lap percent for progressive difficulty
-            if self.current_lap_percent < self.final_lap_percent:
+            # Increase lap percent for progressive difficulty only after learn_starts
+            if (
+                self.current_lap_percent < self.final_lap_percent
+                and self.total_steps > self.learn_starts
+            ):
                 self.current_lap_percent = min(
                     self.current_lap_percent + self.lap_percent_increment,
                     self.final_lap_percent,
                 )
                 print(f"increasing to {self.current_lap_percent:.2f} lap percent")
+            else:
+                if self.total_steps <= self.learn_starts:
+                    print(
+                        f"still in learning phase ({self.total_steps}/{self.learn_starts}), not increasing difficulty"
+                    )
 
             return total_reward, True, False
 
