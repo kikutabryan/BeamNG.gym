@@ -62,10 +62,17 @@ class WCARaceGeometry(gym.Env):
         self,
         host="localhost",
         port=25252,
-        lap_percent=1,
+        start_lap_percent=0.05,
+        final_lap_percent=1.0,
+        lap_percent_increment=0.05,
         real_time=False,
         vehicle_index=0,
     ):
+        # Progressive difficulty settings
+        self.final_lap_percent = final_lap_percent
+        self.lap_percent_increment = lap_percent_increment
+        self.current_lap_percent = start_lap_percent
+
         # Simulation settings
         self.sim_rate = 20  # simulation steps per second
         self.action_rate = 5  # actions per second
@@ -78,7 +85,7 @@ class WCARaceGeometry(gym.Env):
 
         # Spawn settings
         self.random_position_range = (
-            2.0  # Maximum random offset in x,y coordinates (meters)
+            3.0  # Maximum random offset in x,y coordinates (meters)
         )
         self.random_angle_range = (
             20.0  # Maximum random offset in rotation angle (degrees)
@@ -159,7 +166,6 @@ class WCARaceGeometry(gym.Env):
         )
 
         # Track and vehicle setup
-        self.lap_percent = lap_percent
         self.max_lap_time = 5 * 60
         self.spine = None
         self.l_edge = None
@@ -209,7 +215,7 @@ class WCARaceGeometry(gym.Env):
         self._configure_simulation()
 
         # Set states
-        self.state.remaining_time = self.max_lap_time * self.lap_percent + 10
+        self.state.remaining_time = self.max_lap_time * self.current_lap_percent + 10
         self.state.curr_dist = 0  # Reset current distance
 
         # Reset history queues
@@ -233,7 +239,6 @@ class WCARaceGeometry(gym.Env):
         # BeamNG config
         self.vehicle.control(throttle=0.0, brake=0.0, steering=0.0)
         self.bng.scenario.restart()
-        self.bng.control.step(self.sim_rate * 0.5)
         self.vehicle.recover()
         self.bng.control.pause()
         self.vehicle.set_shift_mode("realistic_automatic")
@@ -596,8 +601,17 @@ class WCARaceGeometry(gym.Env):
         total_reward = speed_reward + steer_punishment
 
         # Race complete
-        if self.state.curr_dist > self.spine.length * self.lap_percent:
-            print("race complete")
+        if self.state.curr_dist > self.spine.length * self.current_lap_percent:
+            print(f"race complete at {self.current_lap_percent:.2f} lap percent")
+
+            # Increase lap percent for progressive difficulty
+            if self.current_lap_percent < self.final_lap_percent:
+                self.current_lap_percent = min(
+                    self.current_lap_percent + self.lap_percent_increment,
+                    self.final_lap_percent,
+                )
+                print(f"increasing to {self.current_lap_percent:.2f} lap percent")
+
             return total_reward, True, False
 
         return total_reward, False, False
