@@ -27,6 +27,7 @@ class RewardSettings:
     too_long_penalty: float
     speed_factor: float
     steer_factor: float
+    min_speed: float
 
 
 @dataclass
@@ -82,10 +83,7 @@ class WCARaceGeometry(gym.Env):
         self.action_rate = 5  # actions per second
         self.steps = self.sim_rate // self.action_rate
         self.real_time = real_time
-        history_time = 1  # seconds
-        self.history_size = (
-            history_time * self.action_rate
-        )  # Number of past values to keep in history queues
+        self.history_size = 1
 
         # Define default start position and rotation
         self.default_pos = (394.5, -247.925, 145.25)
@@ -164,12 +162,13 @@ class WCARaceGeometry(gym.Env):
         # Reward and penalty settings
         self.reward_settings = RewardSettings(
             max_damage=1000,
-            damage_penalty=-250,
-            out_of_bounds_penalty=-250,
-            wrong_way_penalty=-250,
-            too_long_penalty=-250,
-            speed_factor=0.01,
+            damage_penalty=-200,
+            out_of_bounds_penalty=-200,
+            wrong_way_penalty=-200,
+            too_long_penalty=-200,
+            speed_factor=0.05,
             steer_factor=0.5,
+            min_speed=0,
         )
 
         # Track and vehicle setup
@@ -580,22 +579,37 @@ class WCARaceGeometry(gym.Env):
         )
 
     def _get_reward(self, observation: np.ndarray) -> Tuple[float, bool, bool]:
+        # Crash penalty
+        # Only used if the maximum damage is exceeded, or out of bounds, or wrong way
+        angle = observation[self.history_size - 1]
+        velocity = observation[2 * self.history_size]
+        crash_penalty = 5 * (
+            -np.abs(angle)
+            / (np.pi / 2)
+            * self.reward_settings.speed_factor
+            * velocity**2
+        )
+
         # Maximum damage
         if self.vehicle.sensors["damage"]["damage"] > self.reward_settings.max_damage:
             print("reset: damage exceeded")
-            return self.reward_settings.damage_penalty, True, False
+            return self.reward_settings.damage_penalty + crash_penalty, True, False
 
         # Out of bounds
         vehicle_pos = Point(*self.vehicle.state["pos"])
         if not self.polygon.contains(vehicle_pos):
             print("reset: out of bounds")
-            return self.reward_settings.out_of_bounds_penalty, True, False
+            return (
+                self.reward_settings.out_of_bounds_penalty + crash_penalty,
+                True,
+                False,
+            )
 
         # Wrong way
         spine_speed = observation[-1]
         if spine_speed < -5:
             print("reset: wrong way")
-            return self.reward_settings.wrong_way_penalty, True, False
+            return self.reward_settings.wrong_way_penalty + crash_penalty, True, False
 
         # Too long
         if self.state.remaining_time <= 0:
@@ -603,19 +617,27 @@ class WCARaceGeometry(gym.Env):
             return self.reward_settings.too_long_penalty, False, True
 
         # Spine speed reward
-        # x^2 + x used as base function as x^2 alone would not provide enough reward
-        # and x would not incentivize going faster, as integrating x for the track
-        # would be proportional to track length.
-        speed_reward = self.reward_settings.speed_factor * (
-            np.sign(spine_speed) * spine_speed**2 + spine_speed
-        )
+        # Quadratic function utilized as linear would result in the same reward for
+        # a given track regardless of the car's spine speed.
+        # Reward function is offset by a minimum threshold speed to ensure a
+        # punishment is added if the car stays below this speed.
+        if spine_speed >= self.reward_settings.min_speed:
+            speed_reward = (
+                self.reward_settings.speed_factor
+                * (spine_speed - self.reward_settings.min_speed) ** 2
+            )
+        else:
+            speed_reward = -(
+                self.reward_settings.speed_factor
+                * (spine_speed - self.reward_settings.min_speed) ** 2
+            )
 
         # Steering rate punishment
         # Punishment is quadratic wrt steering rate, and proportional to speed reward.
         # Designed to not exceed speed reward so that there is always a reward for
         # progressing along the track, stops converging at local optimum.
         steer_punishment = (
-            -speed_reward
+            -np.abs(speed_reward)
             * self.reward_settings.steer_factor
             * (self.state.steering_rate**2 / self.max_steer_rate**2)
         )
