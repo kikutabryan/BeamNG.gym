@@ -48,10 +48,6 @@ class EnvironmentState:
     steering: float = 0
     gear_index: int = 0
     wheelspeed: float = 0
-    rel_angle_history: deque = field(default_factory=deque)
-    steering_history: deque = field(default_factory=deque)
-    velocity_history: deque = field(default_factory=deque)
-    throttle_history: deque = field(default_factory=deque)
     lidar_distances: np.ndarray = field(
         default_factory=lambda: np.zeros(271, dtype=np.float32)
     )
@@ -69,6 +65,7 @@ class WCARaceGeometry(gym.Env):
         real_time=False,
         vehicle_index=0,
         randomize_start=False,
+        enable_logging=False,
     ):
         # Progressive difficulty settings
         self.final_lap_percent = final_lap_percent
@@ -77,13 +74,13 @@ class WCARaceGeometry(gym.Env):
         self.learn_starts = learn_starts
         self.total_steps = 0
         self.randomize_start = randomize_start
+        self.enable_logging = enable_logging
 
         # Simulation settings
         self.sim_rate = 20  # simulation steps per second
         self.action_rate = 5  # actions per second
         self.steps = self.sim_rate // self.action_rate
         self.real_time = real_time
-        self.history_size = 1
 
         # Define default start position and rotation
         self.default_pos = (394.5, -247.925, 145.25)
@@ -155,7 +152,7 @@ class WCARaceGeometry(gym.Env):
         self.lidar_info = LidarSettings(
             start_angle=-np.deg2rad(135),
             end_angle=np.deg2rad(135),
-            num_rays=101,
+            num_rays=31,
             max_dist=500,
         )
 
@@ -182,19 +179,6 @@ class WCARaceGeometry(gym.Env):
         # Initialize state
         self.state = EnvironmentState()
 
-        # Set maxlen for history deques
-        self.state.rel_angle_history = deque(maxlen=self.history_size)
-        self.state.steering_history = deque(maxlen=self.history_size)
-        self.state.velocity_history = deque(maxlen=self.history_size)
-        self.state.throttle_history = deque(maxlen=self.history_size)
-
-        # Initialize history queues with zeros
-        for _ in range(self.history_size):
-            self.state.rel_angle_history.append(0.0)
-            self.state.steering_history.append(0.0)
-            self.state.velocity_history.append(0.0)
-            self.state.throttle_history.append(0.0)
-
         # Define action and observation spaces
         self.action_space = self._action_space()
         self.observation_space = self._observation_space()
@@ -213,7 +197,14 @@ class WCARaceGeometry(gym.Env):
         # Initialize simulation
         self._initialize_simulation()
 
+        # Logging setup
+        if self.enable_logging:
+            self.log_file = open("race_track_data.csv", "w")
+            self.log_file.write("step,x,y,z,angle,speed,spine_speed\n")
+
     def __del__(self):
+        if hasattr(self, "log_file") and self.log_file:
+            self.log_file.close()
         self.bng.close()
 
     def _initialize_simulation(self):
@@ -223,24 +214,6 @@ class WCARaceGeometry(gym.Env):
         # Set states
         self.state.remaining_time = self.max_lap_time * self.current_lap_percent + 30
         self.state.curr_dist = 0  # Reset current distance
-
-        # Reset history queues
-        self.state.rel_angle_history.clear()
-        self.state.steering_history.clear()
-        self.state.velocity_history.clear()
-        self.state.throttle_history.clear()
-
-        # Ensure correct maxlen
-        self.state.rel_angle_history = deque(maxlen=self.history_size)
-        self.state.steering_history = deque(maxlen=self.history_size)
-        self.state.velocity_history = deque(maxlen=self.history_size)
-        self.state.throttle_history = deque(maxlen=self.history_size)
-
-        for _ in range(self.history_size):
-            self.state.rel_angle_history.append(0.0)
-            self.state.steering_history.append(0.0)
-            self.state.velocity_history.append(0.0)
-            self.state.throttle_history.append(0.0)
 
         # BeamNG config
         self.vehicle.control(throttle=0.0, brake=0.0, steering=0.0)
@@ -293,13 +266,13 @@ class WCARaceGeometry(gym.Env):
         return gym.spaces.Box(
             low=np.array(
                 [
-                    *[-np.pi] * self.history_size,  # Relative angle history queue
+                    -np.pi,  # Relative angle
                     -np.pi,  # Elevation angle
-                    *[-np.inf] * self.history_size,  # Vehicle velocity history queue
+                    -np.inf,  # Vehicle velocity
                     0,  # RPM
-                    *[0] * self.history_size,  # Throttle history queue
+                    0,  # Throttle
                     0,  # Brake
-                    *[-1.0] * self.history_size,  # Steering history queue
+                    -1.0,  # Steering
                     -1,  # Gear index
                     0,  # Wheelspeed
                     *[0] * self.lidar_info.num_rays,  # LiDAR
@@ -309,13 +282,13 @@ class WCARaceGeometry(gym.Env):
             ),
             high=np.array(
                 [
-                    *[np.pi] * self.history_size,  # Relative angle history queue
+                    np.pi,  # Relative angle
                     np.pi,  # Elevation angle
-                    *[np.inf] * self.history_size,  # Vehicle velocity history queue
+                    np.inf,  # Vehicle velocity
                     np.inf,  # RPM
-                    *[1.0] * self.history_size,  # Throttle history queue
+                    1.0,  # Throttle
                     1.0,  # Brake
-                    *[1.0] * self.history_size,  # Steering history queue
+                    1.0,  # Steering
                     8,  # Gear index
                     np.inf,  # Wheelspeed
                     *[self.lidar_info.max_dist] * self.lidar_info.num_rays,  # LiDAR
@@ -344,11 +317,47 @@ class WCARaceGeometry(gym.Env):
         self.l_edge = LinearRing(l_vtx)
         self.polygon = Polygon([v[0:2] for v in l_vtx], holes=[[v[0:2] for v in r_vtx]])
 
+        # Log track geometry if enabled
+        if self.enable_logging:
+            # Log spine points
+            with open("track_spine.csv", "w") as f:
+                f.write("x,y,z\n")
+                for point in s_vtx:
+                    f.write(f"{point[0]},{point[1]},{point[2]}\n")
+
+            # Log left edge points
+            with open("track_left_edge.csv", "w") as f:
+                f.write("x,y,z\n")
+                for point in l_vtx:
+                    f.write(f"{point[0]},{point[1]},{point[2]}\n")
+
+            # Log right edge points
+            with open("track_right_edge.csv", "w") as f:
+                f.write("x,y,z\n")
+                for point in r_vtx:
+                    f.write(f"{point[0]},{point[1]},{point[2]}\n")
+
+    def _log_data(self):
+        if not self.enable_logging:
+            return
+
+        vehicle_state = self.vehicle.state
+        vehicle_pos = vehicle_state["pos"]
+        vehicle_dir = vehicle_state["dir"]
+        vehicle_angle = np.arctan2(vehicle_dir[1], vehicle_dir[0])
+
+        self.log_file.write(
+            f"{self.total_steps},{vehicle_pos[0]},{vehicle_pos[1]},{vehicle_pos[2]},"
+            f"{vehicle_angle},{self.state.vehicle_velocity},{self.state.spine_speed}\n"
+        )
+        self.log_file.flush()
+
     def step(self, action):
         self._update(action)
         self.total_steps += 1  # Increment total steps counter
         observation = self._get_obs()
         reward, terminated, truncated = self._get_reward(observation)
+        self._log_data()  # Log data after each step
         print(f"Reward: {reward:.2f}, Terminated: {terminated}, Truncated: {truncated}")
         return observation, reward, terminated, truncated, {}
 
@@ -440,16 +449,6 @@ class WCARaceGeometry(gym.Env):
         )
         self.state.spine_speed = self._get_spine_speed(vehicle_pos)
 
-        # Update history queues
-        rel_angle = np.clip(self.state.vehicle_rel_angle, -np.pi, np.pi)
-        steering = np.clip(self.state.steering, -1.0, 1.0)
-        throttle = np.clip(self.state.throttle, 0, 1.0)
-
-        self.state.rel_angle_history.append(rel_angle)
-        self.state.steering_history.append(steering)
-        self.state.velocity_history.append(self.state.vehicle_velocity)
-        self.state.throttle_history.append(throttle)
-
         # Ensure other values stay within observation bounds
         elev_angle = np.clip(self.state.vehicle_elev_angle, -np.pi, np.pi)
         brake = np.clip(self.state.brake, 0, 1.0)
@@ -463,13 +462,13 @@ class WCARaceGeometry(gym.Env):
         # Flatten the observation
         return np.array(
             [
-                *list(self.state.rel_angle_history),  # Relative angle history queue
+                self.state.vehicle_rel_angle,
                 elev_angle,
-                *list(self.state.velocity_history),  # Vehicle velocity history queue
+                self.state.vehicle_velocity,
                 self.state.rpm,
-                *list(self.state.throttle_history),  # Throttle history queue
+                self.state.throttle,
                 brake,
-                *list(self.state.steering_history),  # Steering history queue
+                self.state.steering,
                 gear_index,
                 self.state.wheelspeed,
                 *lidar_distances,
@@ -581,8 +580,8 @@ class WCARaceGeometry(gym.Env):
     def _get_reward(self, observation: np.ndarray) -> Tuple[float, bool, bool]:
         # Crash penalty
         # Only used if the maximum damage is exceeded, or out of bounds, or wrong way
-        angle = observation[self.history_size - 1]
-        velocity = observation[2 * self.history_size]
+        angle = observation[0]
+        velocity = observation[2]
         crash_penalty = 5 * (
             -np.abs(angle)
             / (np.pi / 2)
@@ -619,27 +618,18 @@ class WCARaceGeometry(gym.Env):
         # Spine speed reward
         # Quadratic function utilized as linear would result in the same reward for
         # a given track regardless of the car's spine speed.
-        # Reward function is offset by a minimum threshold speed to ensure a
-        # punishment is added if the car stays below this speed.
-        if spine_speed >= self.reward_settings.min_speed:
-            speed_reward = (
-                self.reward_settings.speed_factor
-                * (spine_speed - self.reward_settings.min_speed) ** 2
-            )
-        else:
-            speed_reward = -(
-                self.reward_settings.speed_factor
-                * (spine_speed - self.reward_settings.min_speed) ** 2
-            )
+        speed_reward = (
+            self.reward_settings.speed_factor * np.sign(spine_speed) * spine_speed**2
+        )
 
         # Steering rate punishment
-        # Punishment is quadratic wrt steering rate, and proportional to speed reward.
+        # Punishment is linear wrt steering rate, and proportional to speed reward.
         # Designed to not exceed speed reward so that there is always a reward for
         # progressing along the track, stops converging at local optimum.
         steer_punishment = (
             -np.abs(speed_reward)
             * self.reward_settings.steer_factor
-            * (self.state.steering_rate**2 / self.max_steer_rate**2)
+            * (self.state.steering_rate / self.max_steer_rate)
         )
 
         # Sum of rewards and punishment
