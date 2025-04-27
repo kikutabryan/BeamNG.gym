@@ -8,6 +8,8 @@ from shapely.geometry import LinearRing, LineString, Point, Polygon
 from dataclasses import dataclass, field
 import random
 from collections import deque
+import time
+import os
 
 
 @dataclass
@@ -66,6 +68,7 @@ class WCARaceGeometry(gym.Env):
         vehicle_index=0,
         randomize_start=False,
         enable_logging=False,
+        log_path=None,
     ):
         # Progressive difficulty settings
         self.final_lap_percent = final_lap_percent
@@ -75,6 +78,8 @@ class WCARaceGeometry(gym.Env):
         self.total_steps = 0
         self.randomize_start = randomize_start
         self.enable_logging = enable_logging
+        self.log_path = log_path
+        self.episode_time = 0
 
         # Simulation settings
         self.sim_rate = 20  # simulation steps per second
@@ -199,13 +204,18 @@ class WCARaceGeometry(gym.Env):
 
         # Logging setup
         if self.enable_logging:
-            self.log_file = open("race_track_data.csv", "w")
-            self.log_file.write("step,x,y,z,angle,speed,spine_speed\n")
+            self._log_data()
 
     def __del__(self):
         if hasattr(self, "log_file") and self.log_file:
             self.log_file.close()
         self.bng.close()
+
+    def close(self):
+        if hasattr(self, "log_file") and self.log_file:
+            self.log_file.close()
+        if hasattr(self, "bng"):
+            self.bng.close()
 
     def _initialize_simulation(self):
         # Set simulation speed
@@ -319,20 +329,31 @@ class WCARaceGeometry(gym.Env):
 
         # Log track geometry if enabled
         if self.enable_logging:
+            # Create log directory if it doesn't exist
+            if self.log_path:
+                os.makedirs(self.log_path, exist_ok=True)
+                spine_file = os.path.join(self.log_path, "track_spine.csv")
+                left_file = os.path.join(self.log_path, "track_left_edge.csv")
+                right_file = os.path.join(self.log_path, "track_right_edge.csv")
+            else:
+                spine_file = "track_spine.csv"
+                left_file = "track_left_edge.csv"
+                right_file = "track_right_edge.csv"
+
             # Log spine points
-            with open("track_spine.csv", "w") as f:
+            with open(spine_file, "w") as f:
                 f.write("x,y,z\n")
                 for point in s_vtx:
                     f.write(f"{point[0]},{point[1]},{point[2]}\n")
 
             # Log left edge points
-            with open("track_left_edge.csv", "w") as f:
+            with open(left_file, "w") as f:
                 f.write("x,y,z\n")
                 for point in l_vtx:
                     f.write(f"{point[0]},{point[1]},{point[2]}\n")
 
             # Log right edge points
-            with open("track_right_edge.csv", "w") as f:
+            with open(right_file, "w") as f:
                 f.write("x,y,z\n")
                 for point in r_vtx:
                     f.write(f"{point[0]},{point[1]},{point[2]}\n")
@@ -346,23 +367,55 @@ class WCARaceGeometry(gym.Env):
         vehicle_dir = vehicle_state["dir"]
         vehicle_angle = np.arctan2(vehicle_dir[1], vehicle_dir[0])
 
+        # Create log directory if it doesn't exist
+        if self.log_path:
+            os.makedirs(self.log_path, exist_ok=True)
+            log_file = os.path.join(self.log_path, "race_track_data.csv")
+            episode_log_file = os.path.join(self.log_path, "episode_results.csv")
+        else:
+            log_file = "race_track_data.csv"
+            episode_log_file = "episode_results.csv"
+
+        # Initialize log files if they don't exist
+        if not hasattr(self, "log_file"):
+            self.log_file = open(log_file, "w")
+            self.log_file.write("step,x,y,z,angle,speed,spine_speed\n")
+            self.episode_log_file = open(episode_log_file, "w")
+            self.episode_log_file.write("steps,lap_time,lap_percentage\n")
+
         self.log_file.write(
             f"{self.total_steps},{vehicle_pos[0]},{vehicle_pos[1]},{vehicle_pos[2]},"
             f"{vehicle_angle},{self.state.vehicle_velocity},{self.state.spine_speed}\n"
         )
         self.log_file.flush()
 
+    def _log_episode_results(self, terminated, truncated):
+        if not self.enable_logging:
+            return
+
+        if terminated or truncated:
+            lap_percentage = self.state.curr_dist / self.spine.length
+            self.episode_log_file.write(
+                f"{self.total_steps},{self.episode_time},{lap_percentage}\n"
+            )
+            self.episode_log_file.flush()
+
     def step(self, action):
         self._update(action)
         self.total_steps += 1  # Increment total steps counter
+        self.episode_time += 1 / self.action_rate  # Increment episode time by time step
         observation = self._get_obs()
         reward, terminated, truncated = self._get_reward(observation)
         self._log_data()  # Log data after each step
+        self._log_episode_results(
+            terminated, truncated
+        )  # Log episode results if episode ended
         print(f"Reward: {reward:.2f}, Terminated: {terminated}, Truncated: {truncated}")
         return observation, reward, terminated, truncated, {}
 
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed, options=options)
+        self.episode_time = 0  # Reset episode time
 
         if self.randomize_start:
             # Get random point on spine
@@ -420,7 +473,6 @@ class WCARaceGeometry(gym.Env):
             np.clip(self.state.last_steering + self.state.steering_rate, -1, 1)
         )
         self.state.last_steering = steering
-        # print(f"Throttle: {throttle:.2f}, Brake: {brake:.2f}, Steering: {steering:.2f}")
         self.vehicle.control(steering=steering, throttle=throttle, brake=brake)
         self.bng.step(self.steps, wait=True)
         self.state.remaining_time -= 1 / self.action_rate
